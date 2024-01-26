@@ -92,3 +92,7 @@ config/**
 #############
 national-datasets/
 outputs/
+
+# Temp data from Data Ops scripts #
+#############
+tools/usgs_fims_to_geocurves/*/sites.csv
