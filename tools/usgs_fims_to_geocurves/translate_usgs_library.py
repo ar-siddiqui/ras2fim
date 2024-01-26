@@ -1,24 +1,25 @@
 import argparse
-import glob
+import logging
 import os
 import shutil
-import traceback
-import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed, wait
+from concurrent.futures import ProcessPoolExecutor
 from timeit import default_timer as timer
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 
 
-warnings.filterwarnings('ignore')
+logging.captureWarnings(True)
+pd.options.mode.copy_on_write = True  # Enable copy-on-write
 
 
 def identify_best_branch_catchments(huc8_outputs_dir, subset_fim_gdf):
     # Open branch_polygons and check for overlap with subset_fim_gdf
     branch_polygons = os.path.join(huc8_outputs_dir, 'branch_polygons.gpkg')
-    branch_polygons_gdf = gpd.read_file(branch_polygons).to_crs(subset_fim_gdf.crs)
+    branch_polygons_gdf = gpd.read_file(branch_polygons)
+    branch_polygons_gdf = branch_polygons_gdf.to_crs(subset_fim_gdf.crs)
     joined_gdf = branch_polygons_gdf.sjoin(subset_fim_gdf, how='left')
     not_null_rows = joined_gdf['USGSID'].notnull()
     subset_joined_gdf = joined_gdf[not_null_rows]
@@ -59,99 +60,21 @@ def get_union(catchments_gdf, subset_fim_gdf, site_stage):
     return union
 
 
-def reformat_usgs_fims_to_geocurves(
-    usgs_map_gpkg, output_dir, level_path_parent_dir, usgs_rating_curves, usgs_gages_gpkg, job_number
-):
-    # Create output_dir if necessary
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    # Create output directories.
-    final_geocurves_dir = os.path.join(output_dir, 'geocurves')
-    if not os.path.exists(final_geocurves_dir):
-        os.mkdir(final_geocurves_dir)
-
-    final_geom_dir = os.path.join(output_dir, 'geocurve_polys')
-    if not os.path.exists(final_geom_dir):
-        os.mkdir(final_geom_dir)
-
-    start = timer()
-
-    # Load USGS rating curves
-    print("Loading USGS rating curves...")
-    usgs_rc_df = pd.read_csv(usgs_rating_curves)
-
-    # Load USGS gages for metadata lookup
-    print("Loading USGS gages...")
-    usgs_gages_gdf = gpd.read_file(usgs_gages_gpkg)
-
-    # Open and dissolve FIM domain by USGS unique ID.
-    fim_domain_gdf_pre_diss = gpd.read_file(usgs_map_gpkg, layer='fim_model_extent')
-    fim_domain_gdf_pre_diss['usgs_id'] = fim_domain_gdf_pre_diss['USGSID']
-    fim_domain_gdf = fim_domain_gdf_pre_diss.dissolve(by="USGSID")
-
-    print(f"Datasets loaded in {round((timer() - start)/60, 2)} minutes.")
-
-    # Multiprocess translation process
-    if job_number > 1:
-        with ProcessPoolExecutor(max_workers=job_number) as executor:
-            for index, row in fim_domain_gdf.iterrows():
-                executor.submit(
-                    process_translation,
-                    index,
-                    row,
-                    usgs_rc_df,
-                    output_dir,
-                    final_geocurves_dir,
-                    final_geom_dir,
-                    usgs_gages_gdf,
-                    usgs_gages_gpkg,
-                    usgs_map_gpkg,
-                    level_path_parent_dir,
-                )
-    else:
-        for index, row in fim_domain_gdf.iterrows():
-            process_translation(
-                index,
-                row,
-                usgs_rc_df,
-                output_dir,
-                final_geocurves_dir,
-                final_geom_dir,
-                usgs_gages_gdf,
-                usgs_gages_gpkg,
-                usgs_map_gpkg,
-                level_path_parent_dir,
-            )
-
-
-def process_translation(
-    index,
-    row,
-    usgs_rc_df,
-    output_dir,
-    final_geocurves_dir,
-    final_geom_dir,
-    usgs_gages_gdf,
-    usgs_gages_gpkg,
-    usgs_map_gpkg,
-    level_path_parent_dir,
-):
+def translate_site(site, geometry, usgs_rc_df, output_dir, usgs_gages_gdf, usgs_gdb, level_path_parent_dir):
     site_start = timer()
-    site = row['usgs_id']
-    geometry = row['geometry']
 
     # Subset usgs_rc_df to only gage of interest
-    subset_usgs_rc_df = usgs_rc_df.loc[usgs_rc_df.location_id == int(site)]
+    site_usgs_rc_df = usgs_rc_df.loc[usgs_rc_df.location_id == int(site)]
 
     # Exit if site-specific rating curve doesn't exist in provided file
-    if subset_usgs_rc_df.empty:
+    if site_usgs_rc_df.empty:
         print("Missing RC for " + site)
         return
 
     try:
         int(site)
-    except ValueError:
+    except ValueError as e:
+        logging.error(e)
         return
 
     # Create output directory site
@@ -170,9 +93,9 @@ def process_translation(
         os.mkdir(final_dir)
 
     # Load USGS FIM Library geopackage
-    print("Loading USGS FIM library for site " + site + "...")
+    logging.info("Loading USGS FIM library for site " + site + "...")
     usgs_lib_start = timer()
-    usgs_fim_gdf = gpd.read_file(usgs_map_gpkg, layer='fim_flood_extents', mask=geometry)
+    usgs_fim_gdf = gpd.read_file(usgs_gdb, layer='fim_flood_extents', mask=geometry)
     print(site + f" loaded in {round((timer() - usgs_lib_start)/60, 2)} minutes.")
 
     # Determine HUC8  TODO would be faster if FIM library had HUC8 attribute
@@ -180,7 +103,7 @@ def process_translation(
         huc12 = usgs_gages_gdf.loc[usgs_gages_gdf.SITE_NO == site].huc12.values[0]
         huc8 = huc12[:8]
     except IndexError as e:
-        print(e)
+        logging.error(e)
         return  # TODO log, why?
 
     # Subset the entire usgs_fim_gdf library to only one site at a time
@@ -244,12 +167,12 @@ def process_translation(
         if iteration == 1:
             union = get_union(best_match_catchments_gdf, subset_fim_gdf, site_stage)
             union['discharge_cfs'] = round(
-                (np.interp([site_stage], subset_usgs_rc_df['stage'], subset_usgs_rc_df['flow'])[0]), 3
+                (np.interp([site_stage], site_usgs_rc_df['stage'], site_usgs_rc_df['flow'])[0]), 3
             )
         else:
             union_to_append = get_union(best_match_catchments_gdf, subset_fim_gdf, site_stage)
             union_to_append['discharge_cfs'] = round(
-                (np.interp([site_stage], subset_usgs_rc_df['stage'], subset_usgs_rc_df['flow'])[0]), 3
+                (np.interp([site_stage], site_usgs_rc_df['stage'], site_usgs_rc_df['flow'])[0]), 3
             )
 
             union = pd.concat([union, union_to_append])
@@ -292,6 +215,9 @@ def process_translation(
     union_subset = union_subset.to_crs('EPSG:3857')
     # union_subset['geometry'] = union_subset['geometry'].simplify(1)
 
+    final_geocurves_dir = os.path.join(output_dir, 'geocurves')
+    final_geom_dir = os.path.join(output_dir, 'geocurve_polys')
+
     # Subset to each feature_id
     feature_id_list = list(union_subset.feature_id.unique())
     for feature_id_item in feature_id_list:
@@ -326,50 +252,106 @@ def process_translation(
     print()
 
 
-if __name__ == '__main__':
-    # Parse arguments
+def load_datasets(usgs_rating_curves, usgs_gages_gpkg, usgs_gdb):
+    logging.info("Loading USGS rating curves...")
+    usgs_rc_df = pd.read_csv(usgs_rating_curves)
+    logging.info(f"Number of unique rating curve sites in the CSV: {usgs_rc_df['location_id'].nunique()}")
+
+    logging.info("Loading USGS gages...")
+    usgs_gages_gdf = gpd.read_file(usgs_gages_gpkg)
+    logging.info(f"Number of usgs gages in GPKG: {usgs_gages_gdf.shape[0]}")
+
+    logging.info("Loading FIM domains...")
+    fim_domain_gdf_pre_diss = gpd.read_file(usgs_gdb, layer='fim_model_extent')
+    fim_domain_gdf_pre_diss['usgs_id'] = fim_domain_gdf_pre_diss['USGSID']
+    fim_domain_gdf = fim_domain_gdf_pre_diss.dissolve(by="usgs_id")
+    fim_domain_gdf = fim_domain_gdf[['geometry', 'MULTI_SITE']]
+    logging.info(f"Number of unique FIM domains: {fim_domain_gdf.shape[0]}")
+
+    return usgs_rc_df, usgs_gages_gdf, fim_domain_gdf
+
+
+def setup_directories(output_dir: str):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    final_geocurves_dir = os.path.join(output_dir, 'geocurves')
+    final_geom_dir = os.path.join(output_dir, 'geocurve_polys')
+    for dir in [final_geocurves_dir, final_geom_dir]:
+        if not os.path.exists(dir):
+            os.mkdir(dir)
+    return
+
+
+def parse_arguments():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Prototype capability to reformat USGS inundation maps to geocurves.")
+    parser.add_argument("-d", "--usgs_gdb", required=True, type=str, help="Path to USGS FIMs GDB.")
+    parser.add_argument("-o", "--output_dir", required=True, type=str, help="Directory path for output geocurves.")
     parser.add_argument(
-        "-d", "--usgs_map_gpkg", help="Path to USGS FIMs GDB (original source is Esri GDB).", required=True, type=str
+        "-c", "--level_path_parent_dir", required=True, type=str, help="Path to HAND FIM4 parent directory."
     )
+    parser.add_argument("-rc", "--usgs_rating_curves", required=True, type=str, help="Path to rating curves CSV.")
+    parser.add_argument("-g", "--usgs_gages_gpkg", required=True, type=str, help="Path to usgs_gages.gpkg.")
+    parser.add_argument("-j", "--job_number", required=True, type=int, help="Number of jobs to use.")
     parser.add_argument(
-        "-o", "--output_dir", help="Directory path for output geocurves.", required=True, default=None, type=str
+        "-ll", "--log_level", default="INFO", type=str, help="Set the logging level (e.g., INFO, DEBUG)."
     )
+    return parser.parse_args()
 
-    parser.add_argument(
-        "-c",
-        "--level_path_parent_dir",
-        help="Path to HAND FIM4 parent dictory, e.g. 4.X.X.X.",
-        required=True,
-        default=None,
-        type=str,
-    )
 
-    parser.add_argument(
-        "-rc",
-        "--usgs_rating_curves",
-        help="Path to rating curves CSV (available from inundation-mapping data).",
-        required=True,
-        default=None,
-        type=str,
-    )
+def main():
+    load_dotenv()
+    args = parse_arguments()
 
-    parser.add_argument(
-        "-g",
-        "--usgs_gages_gpkg",
-        help="Path to usgs_gages.gpkg (available from inundation-mapping data).",
-        required=True,
-        default=None,
-        type=str,
+    # Set up logging
+    log_level_int = getattr(logging, args.log_level.upper(), None)
+    if not isinstance(log_level_int, int):
+        raise ValueError(f'Invalid log level: { args.log_level}')
+    logging.basicConfig(
+        filename=f'usgs_fim_to_geocurves.log',
+        level=log_level_int,
+        format='%(asctime)s - %(levelname)s - %(module)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
     )
 
-    parser.add_argument("-j", "--job_number", help="Number of jobs to use.", required=True, default=None, type=int)
+    # Setup directories
+    setup_directories(args.output_dir)
 
-    # TODO need to find the right branch catchments layer for cutting for each site. Go with biggest?
-
+    # Read datasets and load in memory
     start = timer()
+    usgs_rc_df, usgs_gages_gdf, fim_domain_gdf = load_datasets(
+        args.usgs_rating_curves, args.usgs_gages_gpkg, args.usgs_gdb
+    )
+    logging.info(f"Datasets loaded in {round((timer() - start)/60, 2)} minutes.")
 
-    # Extract to dictionary and run
-    reformat_usgs_fims_to_geocurves(**vars(parser.parse_args()))
+    # Run translation process for each FIM Domain
+    if args.job_number > 1:
+        with ProcessPoolExecutor(max_workers=args.job_number) as executor:
+            for _, row in fim_domain_gdf.iterrows():
+                executor.submit(
+                    translate_site,
+                    index,
+                    row['geometry'],
+                    usgs_rc_df,
+                    args.output_dir,
+                    usgs_gages_gdf,
+                    args.usgs_gdb,
+                    args.level_path_parent_dir,
+                )
+    else:
+        for index, row in fim_domain_gdf.iterrows():
+            translate_site(
+                index,
+                row['geometry'],
+                usgs_rc_df,
+                args.output_dir,
+                usgs_gages_gdf,
+                args.usgs_gdb,
+                args.level_path_parent_dir,
+            )
+            exit()
+    logging.info(f"Completed in {round((timer() - start)/60, 2)} minutes.")
 
-    print(f"Completed in {round((timer() - start)/60, 2)} minutes.")
+
+if __name__ == '__main__':
+    main()
