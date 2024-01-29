@@ -3,9 +3,10 @@ import csv
 import logging
 import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+from multiprocessing import Manager
 from timeit import default_timer as timer
 
 import geopandas as gpd
@@ -85,7 +86,16 @@ def get_union(catchments_gdf, subset_fim_gdf, site_stage):
 
 
 def translate_site(
-    site, geometry, usgs_rc_df, output_dir, usgs_gages_gdf, usgs_gdb, level_path_parent_dir, log_level, log_folder: str
+    site,
+    geometry,
+    usgs_rc_df,
+    output_dir,
+    usgs_gages_gdf,
+    usgs_gdb,
+    level_path_parent_dir,
+    log_level,
+    log_folder: str,
+    lock,
 ) -> SiteProcessingRecord:
     start_time = datetime.now()
 
@@ -291,6 +301,21 @@ def translate_site(
         processing_record.update_on_error("UnknownError", str(e))
         return processing_record
 
+    finally:
+        with lock:
+            with open(f'{log_folder}/sites.csv', 'a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(
+                    [
+                        processing_record.site,
+                        processing_record.status,
+                        processing_record.error,
+                        processing_record.message,
+                        processing_record.start_time,
+                        processing_record.end_time,
+                    ]
+                )
+
 
 def load_datasets(usgs_rating_curves, usgs_gages_gpkg, usgs_gdb, logger):
     logger.info("Loading USGS rating curves...")
@@ -326,13 +351,12 @@ def setup_logging(log_level: int, name: str) -> logging.Logger:
     if not isinstance(log_level, int):
         raise ValueError(f'Invalid log level: {log_level}')
 
-    # Create a new logger for each site
+    # Create a new logger for tihs name
     logger = logging.getLogger(name)
     logger.setLevel(log_level)
 
     # Configure file handler
     file_handler = logging.FileHandler(f'{name}.log')
-    file_handler.setLevel(log_level)
     file_handler.setFormatter(
         logging.Formatter('%(asctime)s - %(levelname)s - %(module)s - %(message)s', '%Y-%m-%d %H:%M:%S')
     )
@@ -386,10 +410,12 @@ def main():
     )
     logger.info(f"Datasets loaded in {datetime.now() - run_time}")
 
+    m = Manager()
+    lock = m.Lock()
     # Run translation process for each FIM Domain
     logger.info(f"Executing individual sites...")
     with ProcessPoolExecutor(max_workers=args.parallel_processes_count) as executor:
-        futures = [
+        for index, row in fim_domain_gdf.iterrows():
             executor.submit(
                 translate_site,
                 index,
@@ -401,16 +427,7 @@ def main():
                 args.level_path_parent_dir,
                 log_level,
                 run_time_str,
-            )
-            for index, row in fim_domain_gdf.iterrows()
-        ]
-
-    with open(f'{run_time_str}/sites.csv', 'a', newline='') as file:
-        writer = csv.writer(file)
-        for future in as_completed(futures):
-            record = future.result()
-            writer.writerow(
-                [record.site, record.status, record.error, record.message, record.start_time, record.end_time]
+                lock,
             )
 
     logger.info(f"Completed in {datetime.now() - run_time}")
