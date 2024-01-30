@@ -88,9 +88,9 @@ def get_union(catchments_gdf, subset_fim_gdf, site_stage):
 def translate_site(
     site,
     geometry,
-    usgs_rc_df,
+    site_usgs_rc_df,
     output_dir,
-    usgs_gages_gdf,
+    site_usgs_gages_gdf,
     usgs_gdb,
     level_path_parent_dir,
     log_level,
@@ -102,31 +102,14 @@ def translate_site(
     logger = setup_logging(log_level, f'{log_folder}/{site}')
     processing_record = SiteProcessingRecord(site=site, start_time=start_time)
     try:
-        try:
-            int(site)
-        except ValueError as e:
-            logger.error(f"{site}: {str(e)}")
-            processing_record.update_on_error("InvalidSiteName", str(e))
-            return processing_record
-
-        # Subset usgs_rc_df to only gage of interest
-        site_usgs_rc_df = usgs_rc_df.loc[usgs_rc_df.location_id == int(site)]
-
         # Exit if site-specific rating curve doesn't exist in provided file
         if site_usgs_rc_df.empty:
             logger.error(f"{site}: Missing rating curve")
             processing_record.update_on_error("MissingRatingCurve", "")
             return processing_record
 
-        # Create output directory site
-        site_dir = os.path.join(output_dir, site)
-        if not os.path.exists(site_dir):
-            os.mkdir(site_dir)
-
-        # Create directories for temporary files.
-        branch_parent_dir = os.path.join(site_dir, 'branches')
-        if not os.path.exists(branch_parent_dir):
-            os.mkdir(branch_parent_dir)
+        # Calculate datum delta
+        datum_delta = site_usgs_rc_df["navd88_datum"].values[0] - site_usgs_rc_df["datum"].values[0]
 
         # Load USGS FIM Library geopackage
         logger.info("Loading USGS FIM library for site " + site + "...")
@@ -136,7 +119,7 @@ def translate_site(
 
         # Determine HUC8  TODO would be faster if FIM library had HUC8 attribute
         try:
-            huc12 = usgs_gages_gdf.loc[usgs_gages_gdf.SITE_NO == site].huc12.values[0]
+            huc12 = site_usgs_gages_gdf.huc12.values[0]
             huc8 = huc12[:8]
         except IndexError as e:
             logger.error(f"{site}: {str(e)}")
@@ -155,7 +138,6 @@ def translate_site(
         else:
             logger.error(f"{site}: Missing branch data")
             processing_record.update_on_error("MissingBranchData", f"Expected {huc8_outputs_dir} to exist")
-            shutil.rmtree(site_dir)
             return processing_record
 
         # Get list of unique stage values
@@ -176,9 +158,6 @@ def translate_site(
         for catchments in branch_path_list:
             branch_id = os.path.split(catchments)[1].split('_')[-1].replace('.gpkg', '')
             branch_id_list.append(branch_id)
-            branch_output_dir = os.path.join(branch_parent_dir, branch_id)
-            if not os.path.exists(branch_output_dir):
-                os.mkdir(branch_output_dir)
 
             # Load catchment geopackage
             if os.path.exists(catchments):
@@ -231,8 +210,10 @@ def translate_site(
             processing_record.update_on_error("UnionEmpty", "")
             return processing_record
 
+        union["navd88_elev"] = union["ELEV"] + datum_delta
+
         # Clean up geodataframe to match ras2fim schema
-        union.rename(columns={'STAGE': 'stage_ft', 'ELEV': 'wse_ft', 'QCFS': 'orig_cfs'}, inplace=True)
+        union.rename(columns={'STAGE': 'stage_ft', 'navd88_elev': 'wse_ft', 'QCFS': 'orig_cfs'}, inplace=True)
         union['discharge_cms'] = round((union['discharge_cfs'] * 0.0283168), 3)
         union['stage_m'] = round(union['stage_ft'] * 0.3048, 3)  # Convert feet to meters
         union['version'] = 'usgs_fim'  # Assuming a constant value
@@ -257,7 +238,7 @@ def translate_site(
         # union_subset.to_file(output_shapefile, driver='GPKG')
 
         # Convert to Web Mercator
-        union_subset = union_subset.to_crs('EPSG:3857')
+        union_subset = union_subset.to_crs('EPSG:5070')
         # union_subset['geometry'] = union_subset['geometry'].simplify(1)
 
         final_geocurves_dir = os.path.join(output_dir, 'geocurves')
@@ -420,9 +401,9 @@ def main():
                 translate_site,
                 index,
                 row['geometry'],
-                usgs_rc_df,
+                usgs_rc_df[usgs_rc_df.location_id == int(index)],
                 args.output_dir,
-                usgs_gages_gdf,
+                usgs_gages_gdf[usgs_gages_gdf.SITE_NO == index],
                 args.usgs_gdb,
                 args.level_path_parent_dir,
                 log_level,
