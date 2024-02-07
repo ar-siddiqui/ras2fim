@@ -241,8 +241,8 @@ def translate_site(
         union_subset = union_subset.to_crs('EPSG:5070')
         # union_subset['geometry'] = union_subset['geometry'].simplify(1)
 
-        final_geocurves_dir = os.path.join(output_dir, 'geocurves')
-        final_geom_dir = os.path.join(output_dir, 'geocurve_polys')
+        geocurves_dir = os.path.join(output_dir, 'geocurves')
+        gpkgs_dir = os.path.join(output_dir, 'polys')
 
         # Subset to each feature_id
         feature_id_list = list(union_subset.feature_id.unique())
@@ -250,28 +250,15 @@ def translate_site(
             feature_id_subset = union_subset.loc[union_subset.feature_id == feature_id_item]
 
             feature_id_subset['filename'] = feature_id_subset.apply(
-                lambda row: f"{final_geom_dir}/{int(feature_id_item)}_HUC_{huc12}_{int(row['stage_mm'])}_mm.gpkg",
-                axis=1,
+                lambda row: f"{int(feature_id_item)}_HUC_{huc12}_{int(row['stage_mm'])}_mm.gpkg", axis=1
             )
-
-            # for idx, row in feature_id_subset.iterrows():
-            #     # Construct the path string for each row using its specific 'stage_mm' value
-            #     path_str = final_geom_dir + '/' + str(int(feature_id_item)) + '_HUC_' + huc12 + '_' + str(int(row['stage_mm'])) + '_mm.gpkg'
-
-            #     # Directly assign the constructed string to the 'path' column for the current row
-            #     feature_id_subset.loc[idx, 'path'] = path_str
 
             # Write polygons using path
-            unique_path_list = list(feature_id_subset.filename.unique())
-            for unique_path in unique_path_list:
-                unique_path_subset = feature_id_subset.loc[feature_id_subset.filename == unique_path]
-                unique_path_subset.to_file(unique_path)
-
-            # Write final CSV for feature_id
-            feature_id_output_csv = os.path.join(
-                final_geocurves_dir, str(int(feature_id_item)) + '_HUC_' + huc12 + '_rating_curve_geo.csv'
-            )
-            feature_id_subset.to_csv(feature_id_output_csv)
+            gpkgs_names = list(feature_id_subset.filename.unique())
+            for gpkg_name in gpkgs_names:
+                unique_path_subset = feature_id_subset.loc[feature_id_subset.filename == gpkgs_names]
+                gpkg_path = os.path.join(gpkgs_dir, gpkg_name)
+                unique_path_subset.to_file(gpkg_path)
 
         logger.info(f"{site} completed in {datetime.now() - start_time}")
         processing_record.update_on_success()
